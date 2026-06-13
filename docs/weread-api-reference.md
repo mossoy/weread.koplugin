@@ -1099,7 +1099,160 @@ Fix:
 - Add them to EPUB manifest.
 - Rewrite `img src` to local relative paths.
 
-## 6. Known Gaps
+## 6. MP (公众号) Article Interfaces
+
+MP books are public account subscriptions. Their `bookId` starts with `MP_WXS_` (e.g. `MP_WXS_3286016687`). Content fetching is completely different from regular epub/txt books.
+
+### 6.1 Identifying MP Books
+
+From `/shelf/sync` response:
+
+```text
+bookId starts with "MP_WXS_"  →  MP book
+bookId is numeric string       →  regular book
+```
+
+MP books have `author: "公众号"` and no `category` field.
+
+### 6.2 MP Reader URL
+
+```text
+https://weread.qq.com/web/mp/reader/{_e(bookId)}
+```
+
+Note the `/mp/reader/` path (vs `/reader/` for regular books). The `_e()` encoding is identical.
+
+### 6.3 MP Article List
+
+Endpoint:
+
+```text
+GET https://weread.qq.com/web/mp/articles?bookId={bookId}&offset={offset}
+```
+
+Authentication: Web cookies (same as regular book flow).
+
+Parameters:
+
+| Name | Type | Required | Notes |
+|---|---|---:|---|
+| `bookId` | string | yes | Must include `MP_WXS_` prefix |
+| `offset` | int | no | Pagination offset, default `0` |
+
+Response:
+
+```json
+{
+  "reviews": [
+    {
+      "createTime": 1780620501,
+      "subCount": 1,
+      "subReviews": [
+        {
+          "reviewId": "MP_WXS_3286016687_9gm5eWle7VrEYNiwBGaaOQ",
+          "review": {
+            "reviewId": "MP_WXS_3286016687_9gm5eWle7VrEYNiwBGaaOQ",
+            "type": 16,
+            "createTime": 1780620501,
+            "belongBookId": "MP_WXS_3286016687",
+            "mpInfo": {
+              "title": "科技爱好者周刊#399：中国 AI 大厂访问记",
+              "originalId": "9gm5eWle7VrEYNiwBGaaOQ",
+              "pic_url": "https://mmbiz.qpic.cn/..."
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "clearAll": 0,
+  "synckey": 1780620501
+}
+```
+
+Key fields:
+
+- `reviews[].subReviews[].review.reviewId` — used to fetch article content
+- `reviews[].subReviews[].review.mpInfo.title` — article title
+- `reviews[].subReviews[].review.mpInfo.pic_url` — cover image
+- `reviews[].subReviews[].review.createTime` — publish timestamp
+
+Notes:
+
+- Each review group can contain multiple `subReviews` (e.g. multi-article push).
+- `type: 16` indicates an MP article.
+- Pagination: increment `offset` by the number of returned review groups.
+
+### 6.4 MP Article Content
+
+Endpoint:
+
+```text
+GET https://weread.qq.com/web/mp/content?reviewId={reviewId}
+```
+
+Authentication: Web cookies.
+
+Parameters:
+
+| Name | Type | Required |
+|---|---|---:|
+| `reviewId` | string | yes |
+
+Response: **Full HTML page** (typically 2–4 MB), not JSON.
+
+The response is a complete WeChat MP article page including all CSS/JS assets. Article body is inside:
+
+```html
+<div id="js_content" ...>
+  <!-- article HTML content here -->
+</div>
+```
+
+To extract readable content:
+
+1. Find `<div id="js_content">` or `class="rich_media_content"`.
+2. Extract inner HTML.
+3. Strip `<script>`, `<style>`, and non-content elements.
+4. For EPUB packaging, keep the semantic HTML and inline images.
+
+Images in the article body are hosted on `mmbiz.qpic.cn` and can be downloaded directly (no WeRead auth needed).
+
+### 6.5 Differences From Regular Books
+
+| Aspect | Regular book | MP article |
+|---|---|---|
+| bookId format | numeric (`907755`) | `MP_WXS_` prefix |
+| URL path | `/web/reader/` | `/web/mp/reader/` |
+| Chapter concept | `chapterUid` from `chapterInfos` | `reviewId` from `/mp/articles` |
+| Catalog endpoint | `POST /web/book/chapterInfos` | `GET /web/mp/articles?bookId=&offset=` |
+| Content endpoint | `POST /web/book/chapter/e_0..e_3` | `GET /web/mp/content?reviewId=` |
+| Content format | Encoded XHTML (MD5+swap+base64) | Raw HTML page (no decoding needed) |
+| Content extraction | Use decoded XHTML directly | Extract from `<div id="js_content">` |
+| CSS | Separate `e_2` shard | Embedded in HTML page |
+| Images | `tar` archive from `res.weread.qq.com` | Inline `mmbiz.qpic.cn` URLs |
+
+### 6.6 End-to-End MP Fetch Workflow
+
+1. Identify MP book from shelf (`bookId.startsWith("MP_WXS_")`).
+2. Fetch article list:
+
+```text
+GET /web/mp/articles?bookId=MP_WXS_3286016687&offset=0
+```
+
+3. For each article, fetch content:
+
+```text
+GET /web/mp/content?reviewId=MP_WXS_3286016687_9gm5eWle7VrEYNiwBGaaOQ
+```
+
+4. Extract body from `<div id="js_content">`.
+5. Package into EPUB or display directly.
+
+Validated with `scripts/verify_mp_articles.py`.
+
+## 7. Known Gaps
 
 - TXT book flow via `t_0`/`t_1` has not been fully validated.
 - Audio/albums are official skill metadata only; no content download flow is documented here.

@@ -21,6 +21,13 @@ local defaults = {
         download_images = true,
         max_size_mb = 1024,
     },
+    read_report = {
+        enabled = false,
+        book_id = "",
+        book_title = "",
+        interval_seconds = 30,
+        report_on_open = true,
+    },
     advanced = {
         developer_logs = false,
     },
@@ -116,6 +123,23 @@ function Settings:apply_config(config)
             cache[key] = value
         end
         self:set("cache", cache)
+    end
+    if type(config.read_report) == "table" then
+        local rr = self:get("read_report")
+        if config.read_report.interval_seconds then
+            rr.interval_seconds = config.read_report.interval_seconds
+        end
+        if config.read_report.report_on_open ~= nil then
+            rr.report_on_open = config.read_report.report_on_open
+        end
+        if type(config.read_report.book_id) == "string" and config.read_report.book_id ~= "" then
+            rr.book_id = config.read_report.book_id
+            rr.book_title = config.read_report.book_title or rr.book_title
+            if config.read_report.enabled ~= nil then
+                rr.enabled = config.read_report.enabled
+            end
+        end
+        self:set("read_report", rr)
     end
     self:set("config_loaded", true)
     self:flush()

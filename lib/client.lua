@@ -236,6 +236,73 @@ function Client:get_progress(book_id)
     return self:gateway("/book/getprogress", { bookId = book_id })
 end
 
+function Client:get_mp_articles(book_id, max_idx, count, wr_ticket)
+    local url = "https://weread.qq.com/web/mp/articles?bookId="
+        .. WeRead.urlencode(book_id)
+        .. "&maxIdx=" .. tostring(max_idx or 0)
+        .. "&count=" .. tostring(count or 100)
+    local cookies = self.settings:get("cookies", {})
+    local headers = {
+        ["Accept"] = "application/json, text/plain, */*",
+        ["Referer"] = "https://weread.qq.com/",
+        ["Cookie"] = Cookie.to_header(cookies),
+    }
+    if wr_ticket and wr_ticket ~= "" then
+        headers["x-wr-ticket"] = wr_ticket
+    end
+    local wrpa = self.settings:get("wr_wrpa", "")
+    if wrpa ~= "" then
+        headers["x-wrpa-0"] = wrpa
+    end
+    local text, code, resp_headers = self:request({
+        url = url,
+        method = "GET",
+        headers = headers,
+    })
+    local set_cookie = header_value(resp_headers, "set-cookie")
+    if set_cookie then
+        self.settings:set("cookies", Cookie.merge_set_cookie(cookies, set_cookie))
+        self.settings:flush()
+    end
+    if code and code >= 200 and code < 300 then
+        local data = self:json_decode(text)
+        if data.errCode and data.errCode ~= 0 then
+            return nil, data.errCode
+        end
+        return data, nil
+    end
+    error(("HTTP %s: %s"):format(tostring(code), text or ""))
+end
+
+function Client:get_mp_content(review_id)
+    local url = "https://weread.qq.com/web/mp/content?reviewId="
+        .. WeRead.urlencode(review_id)
+    local cookies = self.settings:get("cookies", {})
+    local headers = {
+        ["Accept"] = "text/html,application/xhtml+xml,*/*",
+        ["Referer"] = "https://weread.qq.com/",
+        ["Cookie"] = Cookie.to_header(cookies),
+    }
+    local wrpa = self.settings:get("wr_wrpa", "")
+    if wrpa ~= "" then
+        headers["x-wrpa-0"] = wrpa
+    end
+    local text, code, resp_headers = self:request({
+        url = url,
+        method = "GET",
+        headers = headers,
+    })
+    local set_cookie = header_value(resp_headers, "set-cookie")
+    if set_cookie then
+        self.settings:set("cookies", Cookie.merge_set_cookie(cookies, set_cookie))
+        self.settings:flush()
+    end
+    if code and code >= 200 and code < 300 then
+        return text
+    end
+    error(("HTTP %s: %s"):format(tostring(code), text and text:sub(1, 200) or ""))
+end
+
 function Client:report_read(payload, referer)
     return self:post_json("https://weread.qq.com/web/book/read", payload, {
         referer = referer or "https://weread.qq.com/",

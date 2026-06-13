@@ -6,6 +6,30 @@ local Content = {}
 
 local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
+local function base64_encode(data)
+    local out = {}
+    local len = #data
+    for i = 1, len, 3 do
+        local a = data:byte(i)
+        local b = i + 1 <= len and data:byte(i + 1) or 0
+        local c = i + 2 <= len and data:byte(i + 2) or 0
+        local n = a * 65536 + b * 256 + c
+        table.insert(out, b64chars:sub(bit.rshift(n, 18) % 64 + 1, bit.rshift(n, 18) % 64 + 1))
+        table.insert(out, b64chars:sub(bit.rshift(n, 12) % 64 + 1, bit.rshift(n, 12) % 64 + 1))
+        if i + 1 <= len then
+            table.insert(out, b64chars:sub(bit.rshift(n, 6) % 64 + 1, bit.rshift(n, 6) % 64 + 1))
+        else
+            table.insert(out, "=")
+        end
+        if i + 2 <= len then
+            table.insert(out, b64chars:sub(n % 64 + 1, n % 64 + 1))
+        else
+            table.insert(out, "=")
+        end
+    end
+    return table.concat(out)
+end
+
 local function basename_safe(value)
     value = tostring(value or ""):gsub("[^%w%._-]", "_")
     if value == "" then
@@ -646,6 +670,50 @@ function Content.rewrite_image_sources(xhtml, src_map)
     return xhtml
 end
 
+function Content.download_remote_images(client, xhtml, used_names, progress)
+    local assets = {}
+    used_names = used_names or {}
+    local img_total = 0
+    xhtml:gsub('src=(["\'])(.-)%1', function(_, src)
+        if src:match("^https?://") then
+            img_total = img_total + 1
+        end
+    end)
+    if img_total == 0 then
+        return xhtml, assets
+    end
+    local index = 0
+    local body = xhtml:gsub('src=(["\'])(.-)%1', function(quote, src)
+        if not src:match("^https?://") then
+            return "src=" .. quote .. src .. quote
+        end
+        index = index + 1
+        if progress then
+            progress(index, img_total)
+        end
+        local url = src
+        if url:match("^//") then
+            url = "https:" .. url
+        end
+        local ok, data = pcall(function()
+            return client:get_binary(url, { referer = "https://weread.qq.com/" })
+        end)
+        if not ok or not data or #data == 0 then
+            return "src=" .. quote .. src .. quote
+        end
+        local ext, mt = media_type_for(data)
+        local fname = unique_asset_name(used_names, "img" .. tostring(index), ext)
+        local href = "images/" .. fname
+        table.insert(assets, {
+            href = href,
+            media_type = mt,
+            data = data,
+        })
+        return "src=" .. quote .. "../" .. href .. quote
+    end)
+    return body, assets
+end
+
 function Content.download_chapter_assets(client, book, chapter, used_names)
     if not chapter or not chapter.tar or chapter.tar == "" then
         return {}, {}
@@ -765,9 +833,15 @@ function Content.fetch_chapter_epub(client, settings, book, chapter)
     local assets = {}
     local cache = settings:get("cache", {})
     if cache.download_images then
+        local used_names = {}
         local src_map
-        assets, src_map = Content.download_chapter_assets(client, book, chapter, {})
+        assets, src_map = Content.download_chapter_assets(client, book, chapter, used_names)
         xhtml = Content.rewrite_image_sources(xhtml, src_map)
+        local inline_xhtml, inline_assets = Content.download_remote_images(client, xhtml, used_names)
+        xhtml = inline_xhtml
+        for _, a in ipairs(inline_assets) do
+            table.insert(assets, a)
+        end
     end
     local path = Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
     book.cached_chapters = book.cached_chapters or {}
@@ -801,10 +875,15 @@ function Content.fetch_chapters_epub(client, settings, book, chapters, options)
                 options.progress(chapter_index, #chapters, chapter, "images")
             end
             local chapter_assets, src_map = Content.download_chapter_assets(client, book, chapter, used_asset_names)
-            for asset_index, asset in ipairs(chapter_assets) do
+            for _, asset in ipairs(chapter_assets) do
                 table.insert(assets, asset)
             end
             xhtml = Content.rewrite_image_sources(xhtml, src_map)
+            local inline_xhtml, inline_assets = Content.download_remote_images(client, xhtml, used_asset_names)
+            xhtml = inline_xhtml
+            for _, a in ipairs(inline_assets) do
+                table.insert(assets, a)
+            end
         end
         local uid = tostring(chapter.chapterUid or chapter_index)
         table.insert(selected, chapter)
@@ -831,6 +910,167 @@ function Content.fetch_first_chapter(client, settings, book)
         error("No readable chapter found")
     end
     return Content.fetch_chapter_epub(client, settings, book, chapter)
+end
+
+function Content.parse_mp_articles(data)
+    local articles = {}
+    for _, group in ipairs(data.reviews or {}) do
+        for _, sub in ipairs(group.subReviews or {}) do
+            local review = sub.review or sub
+            local mp = review.mpInfo or {}
+            table.insert(articles, {
+                reviewId = review.reviewId or "",
+                title = mp.title or "",
+                pic_url = mp.pic_url or "",
+                createTime = review.createTime or 0,
+            })
+        end
+    end
+    return articles
+end
+
+function Content.extract_mp_body(html)
+    html = tostring(html or "")
+    local body = html:match('<div[^>]*id="js_content"[^>]*>(.-)</div>%s*<script')
+    if not body then
+        body = html:match('class="rich_media_content[^"]*"[^>]*>(.-)</div>%s*<script')
+    end
+    if not body then
+        body = html:match('<div[^>]*id="js_content"[^>]*>(.*)')
+    end
+    if not body or body == "" then
+        return nil
+    end
+    body = body:gsub("<script.-</script>", "")
+    body = body:gsub("<style.-</style>", "")
+    body = body:gsub(' src=""', '')
+    body = body:gsub(" src=''", "")
+    body = body:gsub("data%-src=", "src=")
+    return body
+end
+
+local function normalize_void_elements(html)
+    html = html:gsub("<(br)%s*>", "<%1/>")
+    html = html:gsub("<(hr)%s*>", "<%1/>")
+    html = html:gsub("<(img)(%s[^>]-)>", function(tag, attrs)
+        if not attrs:match("/$") then
+            return "<" .. tag .. attrs .. "/>"
+        end
+        return "<" .. tag .. attrs .. ">"
+    end)
+    return html
+end
+
+function Content.download_mp_images(client, body_html, progress, embed_base64)
+    local assets = {}
+    local used_names = {}
+    local img_total = 0
+    body_html:gsub('src=(["\'])(.-)%1', function(quote, src)
+        if src:match("mmbiz%.qpic%.cn") or src:match("mmbiz%.qlogo%.cn") then
+            img_total = img_total + 1
+        end
+    end)
+    local index = 0
+    local body = body_html:gsub('src=(["\'])(.-)%1', function(quote, src)
+        if not src:match("mmbiz%.qpic%.cn") and not src:match("mmbiz%.qlogo%.cn") then
+            return "src=" .. quote .. src .. quote
+        end
+        index = index + 1
+        if progress then
+            progress(index, img_total)
+        end
+        local url = src
+        if url:match("^//") then
+            url = "https:" .. url
+        end
+        local ok, data = pcall(function()
+            return client:get_binary(url, { referer = "https://weread.qq.com/" })
+        end)
+        if not ok or not data or #data == 0 then
+            return "src=" .. quote .. src .. quote
+        end
+        local ext, mt = media_type_for(data)
+        if embed_base64 then
+            local b64 = base64_encode(data)
+            return "src=" .. quote .. "data:" .. mt .. ";base64," .. b64 .. quote
+        end
+        local fname = unique_asset_name(used_names, "img" .. tostring(index), ext)
+        local href = "images/" .. fname
+        table.insert(assets, {
+            href = href,
+            media_type = mt,
+            data = data,
+        })
+        return "src=" .. quote .. "../" .. href .. quote
+    end)
+    return body, assets
+end
+
+function Content.mp_article_path(settings, book, article)
+    local book_id = book.book_id or book.bookId
+    local dir = settings.cache_dir .. "/" .. basename_safe(book_id)
+    local title = filename_safe(article.title or "article")
+    return dir .. "/" .. title .. ".html"
+end
+
+function Content.mp_article_cached_path(settings, book, article)
+    local html_path = Content.mp_article_path(settings, book, article)
+    local f = io.open(html_path, "r")
+    if f then
+        f:close()
+        return html_path
+    end
+    local epub_path = html_path:gsub("%.html$", ".epub")
+    f = io.open(epub_path, "r")
+    if f then
+        f:close()
+        return epub_path
+    end
+    return nil
+end
+
+function Content.save_mp_article_html(settings, book, article, body_html)
+    local book_id = book.book_id or book.bookId
+    local dir = settings.cache_dir .. "/" .. basename_safe(book_id)
+    os.execute("mkdir -p " .. string.format("%q", dir))
+    local title = article.title or "Article"
+    local path = Content.mp_article_path(settings, book, article)
+
+    local html = [[<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>]] .. xml_escape(title) .. [[</title>
+<style>
+body { line-height: 1.8; margin: 5%; }
+img { max-width: 100%; height: auto; }
+h1 { margin-bottom: 1em; }
+p { margin: 0.6em 0; }
+</style>
+</head>
+<body>
+<h1>]] .. xml_escape(title) .. [[</h1>
+]] .. body_html .. [[
+</body>
+</html>]]
+
+    write_file(path, html)
+    return path
+end
+
+function Content.fetch_mp_article_html(client, settings, book, article, opts)
+    opts = opts or {}
+    local html = client:get_mp_content(article.reviewId)
+    local body = Content.extract_mp_body(html)
+    if not body then
+        local preview = tostring(html or ""):sub(1, 300)
+        error("Could not extract article body from HTML:\n" .. preview)
+    end
+    local cache = settings:get("cache", {})
+    if cache.download_images then
+        body = Content.download_mp_images(client, body, opts.progress, true)
+    end
+    return Content.save_mp_article_html(settings, book, article, body)
 end
 
 return Content

@@ -1,5 +1,6 @@
 local BD = require("ui/bidi")
 local ConfirmBox = require("ui/widget/confirmbox")
+local ProgressbarDialog = require("ui/widget/progressbardialog")
 local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
@@ -39,6 +40,10 @@ function WeReadPlugin:init()
     self:loadConfigFile()
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
+    local rr = self.settings:get("read_report")
+    if rr.enabled and rr.book_id ~= "" and not rr.report_on_open then
+        self:startReadReport()
+    end
 end
 
 function WeReadPlugin:loadConfigFile()
@@ -72,6 +77,30 @@ function WeReadPlugin:loadConfigFile()
         local cookies = Cookie.parse_cookie_header(raw_cookie)
         if Cookie.has_login_cookie(cookies) then
             self.settings:set("cookies", cookies)
+        end
+    end
+
+    local mp_source = config.mp_curl or config.curl
+    if type(mp_source) == "string" then
+        local ticket = mp_source:match("%-H%s+['\"][Xx]%-[Ww][Rr]%-[Tt]icket:%s*(.-)['\"]")
+        if ticket and ticket ~= "" then
+            self.settings:set("wr_ticket", ticket)
+        end
+        local wrpa = mp_source:match("%-H%s+['\"][Xx]%-[Ww][Rr][Pp][Aa]%-0:%s*(.-)['\"]")
+        if wrpa and wrpa ~= "" then
+            self.settings:set("wr_wrpa", wrpa)
+        end
+    end
+    if type(config.wr_ticket) == "string" and config.wr_ticket:match("%S") then
+        self.settings:set("wr_ticket", config.wr_ticket)
+    end
+    if type(config.mp_curl) == "string" and config.mp_curl:match("%S") then
+        local mp_cookie = Cookie.extract_from_curl(config.mp_curl)
+        if mp_cookie and mp_cookie:match("%S") then
+            local cookies = Cookie.parse_cookie_header(mp_cookie)
+            if Cookie.has_login_cookie(cookies) then
+                self.settings:set("cookies", cookies)
+            end
         end
     end
 
@@ -127,6 +156,11 @@ function WeReadPlugin:safeCallback(label, callback)
 end
 
 function WeReadPlugin:getMainMenuItems()
+    local rr = self.settings:get("read_report")
+    local report_label = _("Reading time report")
+    if rr.book_title ~= "" then
+        report_label = T(_("Reading time report (%1)"), rr.book_title)
+    end
     local items = {
         {
             text = _("Bookshelf"),
@@ -141,10 +175,10 @@ function WeReadPlugin:getMainMenuItems()
             end),
         },
         {
-            text = _("Paste reader URL"),
-            callback = self:safeCallback(_("Paste reader URL"), function()
-                self:showPasteReaderURL()
-            end),
+            text = report_label,
+            sub_item_table_func = function()
+                return self:getReadReportMenuItems()
+            end,
         },
         {
             text = _("Downloads"),
@@ -467,6 +501,133 @@ function WeReadPlugin:toggleSyncSetting(key)
     self.settings:flush()
 end
 
+function WeReadPlugin:getReadReportMenuItems()
+    local rr = self.settings:get("read_report")
+    return {
+        {
+            text = _("Enable reading time report"),
+            checked_func = function()
+                return self.settings:get("read_report").enabled
+            end,
+            callback = self:safeCallback(_("Enable reading time report"), function()
+                local cur = self.settings:get("read_report")
+                cur.enabled = not cur.enabled
+                self.settings:set("read_report", cur)
+                self.settings:flush()
+                if cur.enabled then
+                    if cur.book_id == "" then
+                        self:showTransientInfo(_("Please select a target book"), 2)
+                        self:showReadReportBookPicker()
+                    else
+                        self:maybeStartReadReport()
+                    end
+                else
+                    self:stopReadReport()
+                end
+            end),
+        },
+        {
+            text = _("Only report when reading"),
+            checked_func = function()
+                return self.settings:get("read_report").report_on_open
+            end,
+            callback = self:safeCallback(_("Only report when reading"), function()
+                local cur = self.settings:get("read_report")
+                cur.report_on_open = not cur.report_on_open
+                self.settings:set("read_report", cur)
+                self.settings:flush()
+                if cur.enabled and cur.book_id ~= "" then
+                    if cur.report_on_open and not self.ui.document then
+                        self:stopReadReport()
+                    else
+                        self:maybeStartReadReport()
+                    end
+                end
+            end),
+        },
+        {
+            text = _("Select target book"),
+            post_text = rr.book_title ~= "" and rr.book_title or _("Not configured"),
+            callback = self:safeCallback(_("Select target book"), function()
+                self:showReadReportBookPicker()
+            end),
+        },
+        {
+            text = _("Report status"),
+            keep_menu_open = true,
+            callback = self:safeCallback(_("Report status"), function()
+                local cur = self.settings:get("read_report")
+                local target = cur.book_title ~= "" and cur.book_title or _("Not configured")
+                local status = self._report_task and _("Running") or _("Stopped")
+                local count = self._report_count or 0
+                local last = self._report_last_time
+                    and os.date("%H:%M:%S", self._report_last_time) or "--"
+                local err = self._report_last_error or ""
+                local msg = T(_("Report target: %1\nStatus: %2"), target, status)
+                    .. "\n" .. T(_("Reported: %1 times, last: %2"), tostring(count), last)
+                if err ~= "" then
+                    msg = msg .. "\n" .. T(_("Last error: %1"), err)
+                end
+                self:showInfo(msg)
+            end),
+        },
+    }
+end
+
+function WeReadPlugin:showReadReportBookPicker()
+    if not self.settings:is_api_configured() then
+        self:showInfo(_("Set the official API key to browse your WeRead shelf. You can still open a book by pasting a reader URL."))
+        return
+    end
+    self:showBusy(_("Loading bookshelf..."))
+    local NetworkMgr = require("ui/network/manager")
+    NetworkMgr:runWhenOnline(function()
+        local ok, result = pcall(function()
+            return self.client:gateway("/shelf/sync", {})
+        end)
+        if not ok then
+            self:closeBusy()
+            self:showInfo(T(_("Load bookshelf failed:\n%1"), tostring(result)))
+            return
+        end
+        self:closeBusy()
+        local all_books = result.books or {}
+        local items = {}
+        for i, book in ipairs(all_books) do
+            if not WeRead.is_mp_book(book.bookId) then
+                table.insert(items, {
+                    text = book.title or book.bookId or _("Untitled"),
+                    post_text = book.author or "",
+                    callback = self:safeCallback(book.title or _("Select target book"), function()
+                        local rr = self.settings:get("read_report")
+                        rr.book_id = book.bookId
+                        rr.book_title = book.title or book.bookId
+                        self.settings:set("read_report", rr)
+                        self.settings:flush()
+                        if self._picker_menu then
+                            UIManager:close(self._picker_menu)
+                            self._picker_menu = nil
+                        end
+                        self:showTransientInfo(T(_("Target book set: %1"), rr.book_title))
+                        self:maybeStartReadReport()
+                    end),
+                })
+            end
+        end
+        if not items or #items == 0 then
+            self:showInfo(_("Your WeRead shelf is empty."))
+            return
+        end
+        self._picker_menu = Menu:new{
+            title = _("Select a book to report reading time"),
+            item_table = items,
+            is_borderless = true,
+            title_bar_fm_style = true,
+        }
+        UIManager:show(self._picker_menu)
+    end)
+end
+
 function WeReadPlugin:showBookshelf()
     if not self.settings:is_api_configured() then
         self:showInfo(_("Set the official API key to browse your WeRead shelf. You can still open a book by pasting a reader URL."))
@@ -483,9 +644,23 @@ function WeReadPlugin:showBookshelf()
             self:showInfo(T(_("Load bookshelf failed:\n%1"), tostring(result)))
             return
         end
-        self.shelf_books = result.books or {}
+        local all_books = result.books or {}
+        self.shelf_regular = {}
+        self.shelf_mp = {}
+        for _, book in ipairs(all_books) do
+            if WeRead.is_mp_book(book.bookId) then
+                table.insert(self.shelf_mp, book)
+            else
+                table.insert(self.shelf_regular, book)
+            end
+        end
+        self.shelf_books = self.shelf_regular
         self:closeBusy()
-        self:showShelfPage(1)
+        if #self.shelf_mp > 0 then
+            self:showShelfTabs()
+        else
+            self:showShelfPage(1)
+        end
     end)
 end
 
@@ -544,6 +719,10 @@ end
 function WeReadPlugin:showBookRecord(book)
     local books = self.settings:get("books", {})
     local book_id = book.book_id or book.bookId
+    if WeRead.is_mp_book(book_id) then
+        self:showMPAccount(book)
+        return
+    end
     if book_id then
         books[book_id] = books[book_id] or {}
         books[book_id].book_id = book_id
@@ -613,6 +792,292 @@ function WeReadPlugin:showBookMenu(book)
     self:showList(book.title or _("Book details"), items, _("No actions."))
 end
 
+function WeReadPlugin:showShelfTabs()
+    local items = {
+        {
+            text = _("Books"),
+            post_text = T(_("%1 books"), tostring(#self.shelf_regular)),
+            callback = self:safeCallback(_("Books"), function()
+                self.shelf_books = self.shelf_regular
+                self:showShelfPage(1)
+            end),
+        },
+        {
+            text = _("Public Accounts"),
+            post_text = T(_("%1 accounts"), tostring(#self.shelf_mp)),
+            callback = self:safeCallback(_("Public Accounts"), function()
+                self:showMPShelfPage(1)
+            end),
+        },
+    }
+    self:showList(_("WeRead Bookshelf"), items, _("Your WeRead shelf is empty."))
+end
+
+function WeReadPlugin:showMPShelfPage(page)
+    local books = self.shelf_mp or {}
+    local page_size = 20
+    local total = #books
+    local total_pages = math.max(1, math.ceil(total / page_size))
+    page = math.max(1, math.min(page or 1, total_pages))
+
+    local start_index = (page - 1) * page_size + 1
+    local end_index = math.min(total, start_index + page_size - 1)
+    local items = {}
+
+    if page > 1 then
+        table.insert(items, {
+            text = _("Previous page"),
+            post_text = T(_("%1 / %2"), tostring(page - 1), tostring(total_pages)),
+            callback = self:safeCallback(_("Previous page"), function()
+                self:showMPShelfPage(page - 1)
+            end),
+        })
+    end
+
+    for i = start_index, end_index do
+        local book = books[i]
+        if book then
+            table.insert(items, {
+                text = book.title or book.bookId or _("Untitled"),
+                post_text = book.author or "",
+                callback = self:safeCallback(book.title or book.bookId or _("Untitled"), function()
+                    self:showMPAccount(book)
+                end),
+            })
+        end
+    end
+
+    if page < total_pages then
+        table.insert(items, {
+            text = _("Next page"),
+            post_text = T(_("%1 / %2"), tostring(page + 1), tostring(total_pages)),
+            callback = self:safeCallback(_("Next page"), function()
+                self:showMPShelfPage(page + 1)
+            end),
+        })
+    end
+
+    self:showList(
+        T(_("Public Accounts (%1-%2 / %3)"), tostring(start_index), tostring(end_index), tostring(total)),
+        items,
+        _("No items.")
+    )
+end
+
+function WeReadPlugin:showMPAccount(book)
+    if not self.settings:is_cookie_configured() then
+        self:showInfo(_("Import cookie/cURL before loading articles."))
+        return
+    end
+    local book_id = book.book_id or book.bookId
+    local cached = self:getCachedMPArticles(book_id)
+    if cached and #cached > 0 then
+        self:showMPArticleList(book, cached, 1)
+        return
+    end
+    self:fetchMPArticles(book, nil)
+end
+
+function WeReadPlugin:fetchMPArticles(book, wr_ticket)
+    local NetworkMgr = require("ui/network/manager")
+    NetworkMgr:runWhenOnline(function()
+        self:showBusy(_("Loading articles..."))
+        local book_id = book.book_id or book.bookId
+        local ticket = wr_ticket or self.settings:get("wr_ticket", "")
+        if ticket == "" then ticket = nil end
+        local ok, result, err_code = pcall(function()
+            return self.client:get_mp_articles(book_id, 0, 100, ticket)
+        end)
+        self:closeBusy()
+        if not ok then
+            self:showInfo(T(_("Load articles failed:\n%1"), tostring(result)))
+            return
+        end
+        if not result and (err_code == -2041 or err_code == -2012) then
+            local saved_ticket = self.settings:get("wr_ticket", "")
+            if saved_ticket ~= "" then
+                self:showInfo(T(_("Load articles failed:\n%1"), "wr_ticket expired, update wr_ticket in config.lua"))
+            else
+                self:showInfo(_("MP articles require wr_ticket. Set wr_ticket in config.lua, then reload config."))
+            end
+            return
+        end
+        if not result then
+            self:showInfo(T(_("Load articles failed:\n%1"), "errCode " .. tostring(err_code)))
+            return
+        end
+        local articles = Content.parse_mp_articles(result)
+        self:cacheMPArticles(book_id, articles)
+        self:showMPArticleList(book, articles, 1)
+    end)
+end
+
+function WeReadPlugin:showWrTicketDialog(book)
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Provide x-wr-ticket"),
+        input = self.settings:get("wr_ticket", ""),
+        input_type = "text",
+        description = _("MP article list requires a browser token.\n\n1. Open weread.qq.com in a browser\n2. Open an MP account page\n3. Open DevTools (F12) → Network tab\n4. Find the /web/mp/articles request\n5. Copy the x-wr-ticket header value\n\nPaste it here (or paste the full cURL):"),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = self:safeCallback(_("Cancel"), function()
+                        UIManager:close(dialog)
+                    end),
+                },
+                {
+                    text = _("Fetch"),
+                    is_enter_default = true,
+                    callback = self:safeCallback(_("Fetch"), function()
+                        local input = dialog:getInputText()
+                        UIManager:close(dialog)
+                        local ticket = input
+                        local extracted = input:match("%-H%s+['\"][Xx]%-[Ww][Rr]%-[Tt]icket:%s*(.-)['\"]")
+                        if extracted then
+                            ticket = extracted
+                        end
+                        if not ticket or ticket == "" then
+                            self:showInfo(_("No ticket provided."))
+                            return
+                        end
+                        self.settings:set("wr_ticket", ticket)
+                        self.settings:flush()
+                        self:fetchMPArticles(book, ticket)
+                    end),
+                },
+            },
+        },
+    }
+    self:showInputDialog(dialog)
+end
+
+function WeReadPlugin:getCachedMPArticles(book_id)
+    local books = self.settings:get("books", {})
+    local record = books[book_id]
+    if record and record.mp_articles then
+        return record.mp_articles
+    end
+    return nil
+end
+
+function WeReadPlugin:cacheMPArticles(book_id, articles)
+    local books = self.settings:get("books", {})
+    books[book_id] = books[book_id] or {}
+    books[book_id].mp_articles = articles
+    books[book_id].mp_articles_time = os.time()
+    self.settings:set("books", books)
+    self.settings:flush()
+end
+
+function WeReadPlugin:showMPArticleList(book, articles, page)
+    local page_size = 20
+    local total = #articles
+    local total_pages = math.max(1, math.ceil(total / page_size))
+    page = math.max(1, math.min(page or 1, total_pages))
+
+    local start_index = (page - 1) * page_size + 1
+    local end_index = math.min(total, start_index + page_size - 1)
+    local items = {}
+
+    if page > 1 then
+        table.insert(items, {
+            text = _("Previous page"),
+            post_text = T(_("%1 / %2"), tostring(page - 1), tostring(total_pages)),
+            callback = self:safeCallback(_("Previous page"), function()
+                self:showMPArticleList(book, articles, page - 1)
+            end),
+        })
+    end
+
+    for i = start_index, end_index do
+        local article = articles[i]
+        if article then
+            local cached_path = Content.mp_article_cached_path(self.settings, book, article)
+            local is_cached = cached_path ~= nil
+            local date_str = ""
+            if article.createTime and article.createTime > 0 then
+                date_str = os.date("%Y-%m-%d", article.createTime)
+            end
+            table.insert(items, {
+                text = article.title or _("Article"),
+                post_text = date_str,
+                mandatory = is_cached and _("Cached") or "",
+                callback = self:safeCallback(article.title or _("Article"), function()
+                    if is_cached then
+                        self:openFile(cached_path)
+                    else
+                        self:downloadMPArticleAndRead(book, article)
+                    end
+                end),
+            })
+        end
+    end
+
+    if page < total_pages then
+        table.insert(items, {
+            text = _("Next page"),
+            post_text = T(_("%1 / %2"), tostring(page + 1), tostring(total_pages)),
+            callback = self:safeCallback(_("Next page"), function()
+                self:showMPArticleList(book, articles, page + 1)
+            end),
+        })
+    end
+
+    table.insert(items, {
+        text = _("Refresh article list"),
+        callback = self:safeCallback(_("Refresh article list"), function()
+            self:showWrTicketDialog(book)
+        end),
+    })
+
+    self:showList(
+        book.title or _("Public Account"),
+        items,
+        _("No articles.")
+    )
+end
+
+function WeReadPlugin:downloadMPArticleAndRead(book, article)
+    if not self.settings:is_cookie_configured() then
+        self:showInfo(_("Import cookie/cURL before downloading articles."))
+        return
+    end
+    local NetworkMgr = require("ui/network/manager")
+    NetworkMgr:runWhenOnline(function()
+        self:showBusy(T(_("Downloading article: %1"), article.title or ""))
+        local progress_dialog
+        local ok, path_or_err = pcall(function()
+            return Content.fetch_mp_article_html(self.client, self.settings, book, article, {
+                progress = function(current, total)
+                    if not progress_dialog then
+                        self:closeBusy()
+                        progress_dialog = ProgressbarDialog:new{
+                            title = T(_("Downloading images: %1"), article.title or ""),
+                            progress_max = total,
+                        }
+                        progress_dialog:show()
+                        self:refreshUI()
+                    end
+                    progress_dialog:reportProgress(current)
+                end,
+            })
+        end)
+        if progress_dialog then
+            progress_dialog:close()
+        else
+            self:closeBusy()
+        end
+        if not ok then
+            self:showInfo(T(_("Download failed:\n%1"), tostring(path_or_err)))
+            return
+        end
+        self:openFile(path_or_err)
+    end)
+end
+
 function WeReadPlugin:loadChapters(book, callback)
     if book.chapters and #book.chapters > 0 then
         callback(book.chapters)
@@ -673,7 +1138,11 @@ function WeReadPlugin:showChapterList(book, page)
                     text = chapter.title or T(_("Chapter %1"), tostring(chapter.chapterUid)),
                     post_text = cached and _("Cached") or T(_("%1 words"), tostring(chapter.wordCount or 0)),
                     callback = self:safeCallback(chapter.title or _("Chapter"), function()
-                        self:showChapterMenu(book, chapter)
+                        if cached then
+                            self:openFile(cached)
+                        else
+                            self:downloadChapterAndRead(book, chapter)
+                        end
                     end),
                 })
             end
@@ -695,30 +1164,6 @@ function WeReadPlugin:showChapterList(book, page)
             _("No chapters.")
         )
     end)
-end
-
-function WeReadPlugin:showChapterMenu(book, chapter)
-    local cached = book.cached_chapters and book.cached_chapters[tostring(chapter.chapterUid)]
-    local items = {
-        {
-            text = _("Open cached chapter"),
-            post_text = cached or _("Not cached"),
-            callback = self:safeCallback(_("Open cached chapter"), function()
-                if cached then
-                    self:openFile(cached)
-                else
-                    self:showInfo(_("No cached file."))
-                end
-            end),
-        },
-        {
-            text = _("Download chapter and read"),
-            callback = self:safeCallback(_("Download chapter and read"), function()
-                self:downloadChapterAndRead(book, chapter)
-            end),
-        },
-    }
-    self:showList(chapter.title or _("Chapter"), items, _("No actions."))
 end
 
 function WeReadPlugin:openFile(path)
@@ -761,13 +1206,7 @@ function WeReadPlugin:downloadFirstChapterAndRead(book)
             self.settings:flush()
         end
         self:closeBusy()
-        UIManager:show(ConfirmBox:new{
-            text = T(_("Chapter saved:\n%1\n\nRead now?"), path_or_err),
-            ok_text = _("Read now"),
-            ok_callback = self:safeCallback(_("Read now"), function()
-                self:openFile(path_or_err)
-            end),
-        })
+        self:openFile(path_or_err)
     end)
 end
 
@@ -795,13 +1234,7 @@ function WeReadPlugin:downloadChapterAndRead(book, chapter)
             self.settings:flush()
         end
         self:closeBusy()
-        UIManager:show(ConfirmBox:new{
-            text = T(_("Chapter saved:\n%1\n\nRead now?"), path_or_err),
-            ok_text = _("Read now"),
-            ok_callback = self:safeCallback(_("Read now"), function()
-                self:openFile(path_or_err)
-            end),
-        })
+        self:openFile(path_or_err)
     end)
 end
 
@@ -822,14 +1255,17 @@ end
 
 function WeReadPlugin:confirmDownloadAllChapters(book)
     self:loadChapters(book, function(chapters)
-        UIManager:show(ConfirmBox:new{
+        local confirm
+        confirm = ConfirmBox:new{
             text = T(_("Download all %1 chapters as one EPUB?"), tostring(#chapters)),
             ok_text = _("Download"),
             ok_callback = self:safeCallback(_("Download full book"), function()
+                UIManager:close(confirm)
                 self:downloadChaptersAsBook(book, chapters, "full")
             end),
             cancel_text = _("Close"),
-        })
+        }
+        UIManager:show(confirm)
     end)
 end
 
@@ -840,19 +1276,23 @@ function WeReadPlugin:downloadChaptersAsBook(book, chapters, suffix)
     end
     local NetworkMgr = require("ui/network/manager")
     NetworkMgr:runWhenOnline(function()
-        self:showBusy(_("Preparing download..."))
+        local total = #chapters
+        local progress_dialog = ProgressbarDialog:new{
+            title = T(_("Downloading: %1"), book.title or ""),
+            progress_max = total * 2,
+        }
+        progress_dialog:show()
+        self:refreshUI()
         local ok, path_or_err, saved_chapters = pcall(function()
             return Content.fetch_chapters_epub(self.client, self.settings, book, chapters, {
                 suffix = suffix or "book",
-                progress = function(chapter_index, total, chapter, stage)
-                    if stage == "images" then
-                        self:showBusy(T(_("Downloading images %1 / %2: %3"), tostring(chapter_index), tostring(total), chapter.title or tostring(chapter.chapterUid)))
-                    else
-                        self:showBusy(T(_("Downloading %1 / %2: %3"), tostring(chapter_index), tostring(total), chapter.title or tostring(chapter.chapterUid)))
-                    end
+                progress = function(chapter_index, _total, chapter, stage)
+                    local step = (chapter_index - 1) * 2 + (stage == "images" and 2 or 1)
+                    progress_dialog:reportProgress(step)
                 end,
             })
         end)
+        progress_dialog:close()
         local books = self.settings:get("books", {})
         local book_id = book.book_id or book.bookId
         if book_id then
@@ -860,7 +1300,6 @@ function WeReadPlugin:downloadChaptersAsBook(book, chapters, suffix)
             self.settings:set("books", books)
             self.settings:flush()
         end
-        self:closeBusy()
         if not ok then
             self:showInfo(T(_("Download failed:\n%1"), tostring(path_or_err)))
             return
@@ -1077,6 +1516,130 @@ function WeReadPlugin:onWeReadSyncProgress()
             end)
         end),
     })
+end
+
+function WeReadPlugin:onReaderReady()
+    self:maybeStartReadReport()
+end
+
+function WeReadPlugin:onCloseDocument()
+    local rr = self.settings:get("read_report")
+    if rr.report_on_open then
+        self:stopReadReport()
+    end
+end
+
+function WeReadPlugin:maybeStartReadReport()
+    local rr = self.settings:get("read_report")
+    if not rr.enabled or rr.book_id == "" then
+        return
+    end
+    if rr.report_on_open and not self.ui.document then
+        return
+    end
+    if not self._report_task then
+        self:startReadReport()
+    end
+end
+
+function WeReadPlugin:startReadReport()
+    self:stopReadReport()
+    local rr = self.settings:get("read_report")
+    local interval = rr.interval_seconds or 30
+    self._report_count = 0
+    self._report_last_time = nil
+    self._report_last_error = nil
+    self._report_task = function()
+        local ok, err = pcall(function()
+            self:doReadReport()
+        end)
+        if not ok then
+            self._report_last_error = tostring(err)
+            logger.warn("WeRead: report task error:", err)
+        end
+        if self._report_task then
+            UIManager:scheduleIn(interval, self._report_task)
+        end
+    end
+    UIManager:scheduleIn(interval, self._report_task)
+    logger.info("WeRead: reading time report started, target:", rr.book_title or rr.book_id)
+    self:showTransientInfo(T(_("Reading time report started: %1"), rr.book_title or rr.book_id), 3)
+end
+
+function WeReadPlugin:stopReadReport()
+    if self._report_task then
+        UIManager:unschedule(self._report_task)
+        self._report_task = nil
+        logger.info("WeRead: reading time report stopped")
+    end
+end
+
+function WeReadPlugin:doReadReport()
+    local rr = self.settings:get("read_report")
+    if not rr.enabled or rr.book_id == "" then
+        return
+    end
+    if not self.settings:is_cookie_configured() then
+        logger.warn("WeRead: read report skipped, cookie not configured")
+        return
+    end
+    local curl_payload = self.settings:get("curl_payload", {})
+    local now = os.time()
+    local ts = now * 1000 + math.random(0, 999)
+    local rn = math.random(0, 999)
+    local token = WeRead.DEFAULT_READER_TOKEN
+    local Crypto = require("lib.crypto")
+    local payload = {
+        appId = curl_payload.appId or WeRead.web_app_id(),
+        b = WeRead.e(rr.book_id),
+        c = curl_payload.c or WeRead.e(0),
+        ci = curl_payload.ci or 27,
+        co = curl_payload.co or 389,
+        sm = curl_payload.sm or "",
+        pr = curl_payload.pr or 74,
+        rt = rr.interval_seconds or 30,
+        ts = ts,
+        rn = rn,
+        sg = Crypto.sha256_hex(tostring(ts) .. tostring(rn) .. token),
+        ct = now,
+        ps = curl_payload.ps or WeRead.e(now - 1),
+        pc = WeRead.e(now),
+    }
+    payload.s = WeRead.sign(WeRead.sorted_query(payload))
+    local ok, result = pcall(function()
+        return self.client:report_read(payload)
+    end)
+    if ok and result and result.succ then
+        self._report_count = (self._report_count or 0) + 1
+        self._report_last_time = os.time()
+        self._report_last_error = nil
+        logger.info("WeRead: read report success, count:", self._report_count)
+        return
+    end
+    if ok and result and not result.succ then
+        logger.info("WeRead: read report no succ, attempting cookie renewal")
+        local renew_ok = pcall(function()
+            self.client:renew_cookie()
+        end)
+        if renew_ok then
+            local ok2, result2 = pcall(function()
+                return self.client:report_read(payload)
+            end)
+            if ok2 and result2 and result2.succ then
+                self._report_count = (self._report_count or 0) + 1
+                self._report_last_time = os.time()
+                self._report_last_error = nil
+                logger.info("WeRead: read report success after renewal, count:", self._report_count)
+                return
+            end
+        end
+        self._report_last_error = _("Cookie expired")
+        return
+    end
+    if not ok then
+        self._report_last_error = tostring(result)
+        logger.warn("WeRead: read report error:", self._report_last_error)
+    end
 end
 
 function WeReadPlugin:onFlushSettings()
