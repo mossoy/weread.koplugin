@@ -186,6 +186,7 @@ local zh = {
     ["Directory does not exist and could not be created."] = "目录不存在且无法创建。",
     ["Directory is not writable."] = "目录不可写。",
     ["Clear cache for \"%1\"?"] = "清除「%1」的缓存？",
+    ["Clear all cache"] = "清除所有缓存",
     ["Clear all cache? Downloaded books and articles will be deleted."] = "清除所有缓存？已下载的书籍和文章将被删除。",
     ["[Cleanup] Clear all cache (%1)"] = "【清理】清除所有缓存（%1）",
     ["Clear all public account cache"] = "清除全部公众号缓存",
