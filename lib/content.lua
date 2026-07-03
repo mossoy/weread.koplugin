@@ -47,6 +47,35 @@ function Content.book_cache_dir(settings, book_id)
     return settings.cache_dir .. "/" .. basename_safe(book_id)
 end
 
+-- Resolve where a book's files actually live. The current settings.cache_dir may
+-- differ from where a book was downloaded (the user changed it since), so prefer
+-- concrete evidence of the real location: an explicit book.cache_dir (set when any
+-- file — chapter or MP article — is written), then the directory of a stored
+-- cached_file/chapter path, and only as a last resort the path recomputed under
+-- the current root. This keeps deletion, stats and moves on the real files instead
+-- of orphaning them. MP article-only books have no cached_file, so book.cache_dir
+-- is the only thing that pins them down.
+function Content.book_resolved_dir(settings, book_id, book)
+    if book and type(book.cache_dir) == "string" and book.cache_dir ~= "" then
+        return book.cache_dir
+    end
+    local function dirname(path)
+        if type(path) == "string" then
+            return path:match("^(.*)/[^/]+$")
+        end
+    end
+    local dir = book and dirname(book.cached_file)
+    if not dir and book and type(book.cached_chapters) == "table" then
+        for _i, chapter_path in pairs(book.cached_chapters) do
+            dir = dirname(chapter_path)
+            if dir then
+                break
+            end
+        end
+    end
+    return dir or Content.book_cache_dir(settings, book_id)
+end
+
 local function filename_safe(value)
     value = tostring(value or ""):gsub("[%z%c/\\:%*%?\"<>|]", "_")
     value = value:gsub("^%s+", ""):gsub("%s+$", "")
@@ -1266,7 +1295,7 @@ end
 
 function Content.mp_article_path(settings, book, article)
     local book_id = book.book_id or book.bookId
-    local dir = Content.book_cache_dir(settings, book_id)
+    local dir = Content.book_resolved_dir(settings, book_id, book)
     local title = filename_safe(article.title or "article")
     return dir .. "/" .. title .. ".html"
 end
@@ -1289,7 +1318,10 @@ end
 
 function Content.save_mp_article_html(settings, book, article, body_html)
     local book_id = book.book_id or book.bookId
-    local dir = Content.book_cache_dir(settings, book_id)
+    local dir = Content.book_resolved_dir(settings, book_id, book)
+    -- Pin the real directory on the record so later lookups, moves and cleanup
+    -- can find these files after the download directory changes.
+    book.cache_dir = dir
     os.execute("mkdir -p " .. string.format("%q", dir))
     local title = article.title or "Article"
     local path = Content.mp_article_path(settings, book, article)
