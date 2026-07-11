@@ -501,22 +501,10 @@ function Client:get_chapter_underlines(book_id, chapter_uid)
     return true, result
 end
 
-function Client:get_chapter_reviews(book_id, chapter_uid, ranges)
-    if not book_id or tostring(book_id) == "" then
-        return false, nil, "empty book_id"
-    end
-    if not chapter_uid then
-        return false, nil, "empty chapter_uid"
-    end
-    if type(ranges) ~= "table" or #ranges == 0 then
-        return true, { reviews = {} }
-    end
-
+function Client:build_chapter_review_batches(ranges)
     local BATCH_SIZE = 5
-    local all_reviews = {}
-    local socket_ok, socket = pcall(require, "socket")
-
-    for batch_start = 1, #ranges, BATCH_SIZE do
+    local batches = {}
+    for batch_start = 1, #(ranges or {}), BATCH_SIZE do
         local batch = {}
         for index = batch_start, math.min(batch_start + BATCH_SIZE - 1, #ranges) do
             batch[#batch + 1] = {
@@ -526,22 +514,56 @@ function Client:get_chapter_reviews(book_id, chapter_uid, ranges)
                 synckey = 0,
             }
         end
+        batches[#batches + 1] = batch
+    end
+    return batches
+end
 
-        local ok, result = pcall(function()
-            return self:gateway("/book/readreviews", {
-                bookId = tostring(book_id),
-                chapterUid = chapter_uid,
-                reviews = batch,
-            })
-        end)
+function Client:get_chapter_reviews_batch(book_id, chapter_uid, batch)
+    if not book_id or tostring(book_id) == "" then
+        return false, nil, "empty book_id"
+    end
+    if not chapter_uid then
+        return false, nil, "empty chapter_uid"
+    end
+    if type(batch) ~= "table" or #batch == 0 then
+        return true, { reviews = {} }
+    end
 
+    local ok, result = pcall(function()
+        return self:gateway("/book/readreviews", {
+            bookId = tostring(book_id),
+            chapterUid = chapter_uid,
+            reviews = batch,
+        })
+    end)
+    if not ok then
+        return false, nil, tostring(result)
+    end
+    if type(result) ~= "table" or type(result.reviews) ~= "table" then
+        return false, nil, "readreviews: gateway returned invalid data"
+    end
+    return true, result
+end
+
+function Client:get_chapter_reviews(book_id, chapter_uid, ranges)
+    if type(ranges) ~= "table" or #ranges == 0 then
+        return true, { reviews = {} }
+    end
+
+    local all_reviews = {}
+    local batches = self:build_chapter_review_batches(ranges)
+    local socket_ok, socket = pcall(require, "socket")
+
+    for batch_index, batch in ipairs(batches) do
+        local ok, result = self:get_chapter_reviews_batch(book_id, chapter_uid, batch)
         if ok and type(result) == "table" and type(result.reviews) == "table" then
             for _, review in ipairs(result.reviews) do
                 all_reviews[#all_reviews + 1] = review
             end
         end
 
-        if batch_start + BATCH_SIZE <= #ranges and socket_ok and socket.sleep then
+        if batch_index < #batches and socket_ok and socket.sleep then
             socket.sleep(0.3)
         end
     end

@@ -975,6 +975,37 @@ function Content.fetch_single_chapter_content(client, settings, book, chapter, s
     return xhtml, chapter_assets
 end
 
+-- Split chapter downloading around annotation fetching so the UI can request
+-- thought batches cooperatively instead of blocking inside Thoughts.apply().
+function Content.fetch_single_chapter_source(client, settings, book, chapter, state)
+    state = state or {}
+    local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
+    if not state.css then
+        state.css = Content.fetch_chapter_css(client, settings, book, chapter)
+    end
+    return xhtml
+end
+
+function Content.finalize_single_chapter_content(client, settings, book, chapter, xhtml, state)
+    state = state or {}
+    local chapter_assets = {}
+    local cache = settings:get("cache", {})
+    if cache.download_book_images then
+        state.used_asset_names = state.used_asset_names or {}
+        local tar_assets, src_map = Content.download_chapter_assets(client, book, chapter, state.used_asset_names)
+        for _, asset in ipairs(tar_assets) do
+            table.insert(chapter_assets, asset)
+        end
+        xhtml = Content.rewrite_image_sources(xhtml, src_map)
+        local inline_xhtml, inline_assets = Content.download_remote_images(client, xhtml, state.used_asset_names)
+        xhtml = inline_xhtml
+        for _, asset in ipairs(inline_assets) do
+            table.insert(chapter_assets, asset)
+        end
+    end
+    return xhtml, chapter_assets
+end
+
 function Content.fetch_chapters_epub(client, settings, book, chapters, options)
     options = options or {}
     local selected = {}

@@ -21,6 +21,7 @@ local Content = require("lib.content")
 local Crypto = require("lib.crypto")
 local I18n = require("lib.i18n")
 local Settings = require("lib.settings")
+local Thoughts = require("lib.thoughts")
 local WeRead = require("lib.weread")
 local ThoughtPopup = require("lib.thought_popup")
 
@@ -34,7 +35,7 @@ local unpack_args = unpack or table.unpack
 
 local function thought_perf(stage, started, ...)
     local elapsed = tonumber(time.now() - started) / 1000
-    logger.info(LOG_MODULE, "thought_perf", "stage=", stage,
+    logger.dbg(LOG_MODULE, "thought_perf", "stage=", stage,
         "ms=", string.format("%.1f", elapsed), ...)
 end
 
@@ -474,19 +475,34 @@ function WeReadPlugin:getSettingsMenuItems()
                     {
                         text = _("Underlines and thoughts"),
                         keep_menu_open = true,
+                        check_callback_updates_menu = true,
                         checked_func = function()
                             return self.settings:get("cache").download_underlines_and_thoughts
                         end,
-                        callback = self:safeCallback(_("Underlines and thoughts"), function()
+                        callback = self:safeCallback(_("Underlines and thoughts"), function(touchmenu_instance)
                             local cache = self.settings:get("cache")
-                            cache.download_underlines_and_thoughts = not cache.download_underlines_and_thoughts
-                            self.settings:set("cache", cache)
-                            self.settings:flush()
-                            logger.info(
-                                LOG_MODULE,
-                                "underlines/thoughts download setting changed:",
-                                "enabled=", tostring(cache.download_underlines_and_thoughts)
-                            )
+                            if cache.download_underlines_and_thoughts then
+                                cache.download_underlines_and_thoughts = false
+                                self.settings:set("cache", cache)
+                                self.settings:flush()
+                                logger.info(LOG_MODULE,
+                                    "underlines/thoughts download setting changed:", "enabled=", "false")
+                                touchmenu_instance:updateItems()
+                                return
+                            end
+                            UIManager:show(ConfirmBox:new{
+                                text = _("Downloading underlines and thoughts adds requests for every chapter and may significantly increase download time and cache usage. Continue?"),
+                                ok_text = _("Confirm"),
+                                ok_callback = self:safeCallback(_("Confirm"), function()
+                                    cache.download_underlines_and_thoughts = true
+                                    self.settings:set("cache", cache)
+                                    self.settings:flush()
+                                    logger.info(LOG_MODULE,
+                                        "underlines/thoughts download setting changed:", "enabled=", "true")
+                                    touchmenu_instance:updateItems()
+                                end),
+                                cancel_text = _("Cancel"),
+                            })
                         end),
                     },
                 }
@@ -1001,13 +1017,18 @@ function WeReadPlugin:refreshCacheManagement(message)
     end
 end
 
-function WeReadPlugin:confirmClearBookCache(book_id, title)
+function WeReadPlugin:confirmClearBookCache(book_id, title, on_cleared)
     UIManager:show(ConfirmBox:new{
         text = T(_("Clear cache for \"%1\"?"), title),
         ok_text = _("Clear"),
         ok_callback = function()
             self:clearBookCache(book_id)
-            self:refreshCacheManagement(_("Cache cleared"))
+            if on_cleared then
+                on_cleared()
+                self:showTransientInfo(_("Cache cleared"))
+            else
+                self:refreshCacheManagement(_("Cache cleared"))
+            end
         end,
     })
 end
@@ -1639,81 +1660,103 @@ end
 
 function WeReadPlugin:showBookMenu(book)
     local book_id = book.book_id or book.bookId
-    local items = {}
+    local menu, buildItems
+    local function refresh()
+        if menu then
+            menu:switchItemTable(nil, buildItems())
+        end
+    end
 
-    if book.author and book.author ~= "" then
-        table.insert(items, { text = _("Author"), mandatory = book.author })
-    end
-    if book.translator and book.translator ~= "" then
-        table.insert(items, { text = _("Translator"), mandatory = book.translator })
-    end
-    if book.publisher and book.publisher ~= "" then
-        table.insert(items, { text = _("Publisher"), mandatory = book.publisher })
-    end
-    if book.categoryName and book.categoryName ~= "" then
-        table.insert(items, { text = _("Category"), mandatory = book.categoryName })
-    end
-    if book.wordCount and book.wordCount > 0 then
-        local wc = book.wordCount >= 10000
-            and string.format("%.1f%s", book.wordCount / 10000, _("w words"))
-            or tostring(book.wordCount)
-        table.insert(items, { text = _("Word count"), mandatory = wc })
-    end
-    if book.newRating and book.newRating > 0 then
-        local score = string.format("%.1f", book.newRating / 100)
-        local count = book.newRatingCount and tostring(book.newRatingCount) or "0"
-        table.insert(items, { text = _("Rating"), mandatory = T(_("%1 (%2 ratings)"), score, count) })
-    end
-    if book.isbn and book.isbn ~= "" then
-        table.insert(items, { text = "ISBN", mandatory = book.isbn })
-    end
-    if book.progress and book.progress > 0 then
-        table.insert(items, { text = _("Reading progress"), mandatory = tostring(book.progress) .. "%" })
-    end
-    if book.intro and book.intro ~= "" then
+    buildItems = function()
+        local items = {}
+
+        if book.author and book.author ~= "" then
+            table.insert(items, { text = _("Author"), mandatory = book.author })
+        end
+        if book.translator and book.translator ~= "" then
+            table.insert(items, { text = _("Translator"), mandatory = book.translator })
+        end
+        if book.publisher and book.publisher ~= "" then
+            table.insert(items, { text = _("Publisher"), mandatory = book.publisher })
+        end
+        if book.categoryName and book.categoryName ~= "" then
+            table.insert(items, { text = _("Category"), mandatory = book.categoryName })
+        end
+        if book.wordCount and book.wordCount > 0 then
+            local wc = book.wordCount >= 10000
+                and string.format("%.1f%s", book.wordCount / 10000, _("w words"))
+                or tostring(book.wordCount)
+            table.insert(items, { text = _("Word count"), mandatory = wc })
+        end
+        if book.newRating and book.newRating > 0 then
+            local score = string.format("%.1f", book.newRating / 100)
+            local count = book.newRatingCount and tostring(book.newRatingCount) or "0"
+            table.insert(items, { text = _("Rating"), mandatory = T(_("%1 (%2 ratings)"), score, count) })
+        end
+        if book.isbn and book.isbn ~= "" then
+            table.insert(items, { text = "ISBN", mandatory = book.isbn })
+        end
+        if book.progress and book.progress > 0 then
+            table.insert(items, { text = _("Reading progress"), mandatory = tostring(book.progress) .. "%" })
+        end
+        if book.intro and book.intro ~= "" then
+            table.insert(items, {
+                text = _("Introduction"),
+                callback = function()
+                    UIManager:show(InfoMessage:new{ text = book.intro })
+                end,
+            })
+        end
+
+        if #items > 0 then
+            items[#items].separator = true
+        end
+
+        local saved_books = self.settings:get("books", {})
+        local saved = saved_books[book_id]
+        local cached_path = saved and saved.cached_file or book.cached_file
+        local is_cached = file_exists(cached_path)
+        book.cached_file = is_cached and cached_path or nil
+
         table.insert(items, {
-            text = _("Introduction"),
-            callback = function()
-                UIManager:show(InfoMessage:new{ text = book.intro })
-            end,
-        })
-    end
-
-    if #items > 0 then
-        items[#items].separator = true
-    end
-
-    table.insert(items, {
-        text = _("Chapter list"),
-        post_text = book.chapters and T(_("%1 chapters"), tostring(#book.chapters)) or _("Not loaded"),
-        callback = self:safeCallback(_("Chapter list"), function()
-            self:showChapterList(book)
-        end),
-    })
-    if book.cached_file then
-        table.insert(items, {
-            text = _("Clear book cache"),
-            callback = self:safeCallback(_("Clear book cache"), function()
-                self:confirmClearBookCache(book_id, book.title or book_id)
+            text = _("Chapter list"),
+            post_text = book.chapters and T(_("%1 chapters"), tostring(#book.chapters)) or _("Not loaded"),
+            callback = self:safeCallback(_("Chapter list"), function()
+                self:showChapterList(book)
             end),
         })
+        if is_cached then
+            table.insert(items, {
+                text = _("Clear book cache"),
+                callback = self:safeCallback(_("Clear book cache"), function()
+                    self:confirmClearBookCache(book_id, book.title or book_id, function()
+                        book.cached_file = nil
+                        book.cached_chapters = nil
+                        book.cache_dir = nil
+                        refresh()
+                    end)
+                end),
+            })
+        end
+        table.insert(items, {
+            text = _("Open cached book"),
+            post_text = is_cached and _("Cached") or _("Not cached"),
+            enabled_func = function() return is_cached end,
+            callback = self:safeCallback(_("Open cached book"), function()
+                self:openCachedBook(book)
+            end),
+        })
+        table.insert(items, {
+            text = _("Download full book"),
+            post_text = _("EPUB"),
+            callback = self:safeCallback(_("Download full book"), function()
+                self:confirmDownloadAllChapters(book)
+            end),
+        })
+        return items
     end
-    table.insert(items, {
-        text = _("Open cached book"),
-        post_text = book.cached_file and _("Cached") or _("Not cached"),
-        callback = self:safeCallback(_("Open cached book"), function()
-            self:openCachedBook(book)
-        end),
-    })
-    table.insert(items, {
-        text = _("Download full book"),
-        post_text = _("EPUB"),
-        callback = self:safeCallback(_("Download full book"), function()
-            self:confirmDownloadAllChapters(book)
-        end),
-    })
 
-    self:showList(book.title or _("Book details"), items, _("No actions."))
+    menu = self:showList(book.title or _("Book details"), buildItems(), _("No actions."))
 end
 
 function WeReadPlugin:showShelfTabs()
@@ -2062,61 +2105,22 @@ function WeReadPlugin:openCachedBook(book)
 end
 
 function WeReadPlugin:downloadFirstChapterAndRead(book)
-    if not self.settings:is_cookie_configured() then
-        self:showInfo(_("Import cookie/cURL before downloading book content."))
-        return
-    end
-    self:runOnlineTask(_("Downloading first chapter..."), function()
-        self:showBusy(_("Downloading first chapter, please wait..."))
-        local ok, path_or_err, chapter = pcall(function()
-            return Content.fetch_first_chapter(self.client, self.settings, book)
-        end)
-        if not ok then
-            self:closeBusy()
-            logger.err(LOG_MODULE, "download first chapter failed:", log_error(path_or_err))
-            self:showInfo(T(_("Download failed:\n%1"), display_error(path_or_err)))
+    self:loadChapters(book, function(chapters)
+        local chapter = Content.first_readable_chapter(chapters)
+        if not chapter then
+            self:showInfo(_("No readable chapter found"))
             return
         end
-        local books = self.settings:get("books", {})
-        local book_id = book.book_id or book.bookId
-        if book_id then
-            books[book_id] = book
-            self.settings:set("books", books)
-            self.settings:flush()
-        end
-        self:refreshShelfCacheIndicators()
-        self:closeBusy()
-        self:openFile(path_or_err)
+        self:confirmAndDownloadChapters(book, { chapter }, "first-chapter", {
+            single_chapter = true,
+        })
     end)
 end
 
 function WeReadPlugin:downloadChapterAndRead(book, chapter)
-    if not self.settings:is_cookie_configured() then
-        self:showInfo(_("Import cookie/cURL before downloading book content."))
-        return
-    end
-    self:runOnlineTask(_("Download chapter and read"), function()
-        self:showBusy(T(_("Downloading chapter: %1"), chapter.title or tostring(chapter.chapterUid)))
-        local ok, path_or_err = pcall(function()
-            return Content.fetch_chapter_epub(self.client, self.settings, book, chapter)
-        end)
-        if not ok then
-            self:closeBusy()
-            logger.err(LOG_MODULE, "download chapter failed:", log_error(path_or_err))
-            self:showInfo(T(_("Download failed:\n%1"), display_error(path_or_err)))
-            return
-        end
-        local books = self.settings:get("books", {})
-        local book_id = book.book_id or book.bookId
-        if book_id then
-            books[book_id] = book
-            self.settings:set("books", books)
-            self.settings:flush()
-        end
-        self:refreshShelfCacheIndicators()
-        self:closeBusy()
-        self:openFile(path_or_err)
-    end)
+    self:confirmAndDownloadChapters(book, { chapter }, "chapter", {
+        single_chapter = true,
+    })
 end
 
 function WeReadPlugin:downloadFirstNChapters(book, count)
@@ -2130,32 +2134,56 @@ function WeReadPlugin:downloadFirstNChapters(book, count)
         for chapter_index = 1, limit do
             table.insert(selected, chapters[chapter_index])
         end
-        self:downloadChaptersAsBook(book, selected, "first-" .. tostring(limit))
+        self:confirmAndDownloadChapters(book, selected, "first-" .. tostring(limit))
     end)
 end
 
 function WeReadPlugin:confirmDownloadAllChapters(book)
     self:loadChapters(book, function(chapters)
-        local confirm
-        confirm = ConfirmBox:new{
-            text = T(_("Download all %1 chapters as one EPUB?"), tostring(#chapters)),
-            ok_text = _("Download"),
-            ok_callback = self:safeCallback(_("Download full book"), function()
-                UIManager:close(confirm)
-                self:downloadChaptersAsBook(book, chapters, "full")
-            end),
-            cancel_text = _("Close"),
-        }
-        UIManager:show(confirm)
+        self:confirmAndDownloadChapters(book, chapters, "full", {
+            confirmation_text = T(_("Download all %1 chapters as one EPUB?"), tostring(#chapters)),
+        })
     end)
 end
 
-function WeReadPlugin:downloadChaptersAsBook(book, chapters, suffix)
+-- Show the annotation cost warning consistently for every download entry.
+-- With annotations disabled, single/partial downloads start immediately;
+-- callers with their own confirmation text (the full-book action) keep only
+-- that normal confirmation and do not show the annotation warning.
+function WeReadPlugin:confirmAndDownloadChapters(book, chapters, suffix, options)
+    options = options or {}
+    local includes_annotations = self.settings:get("cache").download_underlines_and_thoughts == true
+    local text = options.confirmation_text
+    if includes_annotations then
+        local warning = _("This download includes underlines and thoughts and may take significantly longer.")
+        text = text and (text .. "\n\n" .. warning) or warning
+    end
+    if not text then
+        self:downloadChaptersAsBook(book, chapters, suffix, options)
+        return
+    end
+
+    local confirm
+    confirm = ConfirmBox:new{
+        text = text,
+        ok_text = _("Download"),
+        ok_callback = self:safeCallback(_("Download"), function()
+            UIManager:close(confirm)
+            self:downloadChaptersAsBook(book, chapters, suffix, options)
+        end),
+        cancel_text = _("Close"),
+    }
+    UIManager:show(confirm)
+end
+
+function WeReadPlugin:downloadChaptersAsBook(book, chapters, suffix, options)
+    options = options or {}
     if not self.settings:is_cookie_configured() then
         self:showInfo(_("Import cookie/cURL before downloading book content."))
         return
     end
-    self:runOnlineTask(_("Download full book"), function()
+    local task_label = options.single_chapter and _("Download chapter and read") or _("Download full book")
+    self:runOnlineTask(task_label, function()
         local ok_init, err_init = pcall(function()
             Content.ensure_reader_state(self.client, book)
         end)
@@ -2178,6 +2206,9 @@ function WeReadPlugin:downloadChaptersAsBook(book, chapters, suffix)
             state = {},
             total = total,
             failed = {},
+            annotation_failed_batches = 0,
+            single_chapter = options.single_chapter == true,
+            started_at = time.now(),
         }
 
         local progress_dialog = DownloadDialog:new{
@@ -2206,6 +2237,194 @@ function WeReadPlugin:downloadChaptersAsBook(book, chapters, suffix)
     end)
 end
 
+function WeReadPlugin:_setDownloadStage(dl, title, progress)
+    if not dl.progress_dialog then return end
+    dl.progress_dialog:setTitle(title)
+    if progress then
+        dl.progress_dialog:reportProgress(progress)
+    end
+end
+
+function WeReadPlugin:_downloadPerf(dl, stage, started, ...)
+    local elapsed = tonumber(time.now() - started) / 1000
+    logger.info(LOG_MODULE, "download_perf", "stage=", stage,
+        "ms=", string.format("%.1f", elapsed),
+        "chapter=", tostring(dl.index) .. "/" .. tostring(dl.total), ...)
+end
+
+function WeReadPlugin:_failCurrentDownloadChapter(dl, err)
+    local chapter = dl.chapters[dl.index]
+    local uid = tostring(chapter and chapter.chapterUid or dl.index)
+    table.insert(dl.failed, uid)
+    logger.warn(LOG_MODULE, "chapter download failed:",
+        "index=", tostring(dl.index) .. "/" .. tostring(dl.total),
+        "chapter_uid=", uid, "error=", log_error(err))
+    dl.current = nil
+    dl.annotation = nil
+    dl.index = dl.index + 1
+    if dl.progress_dialog then
+        dl.progress_dialog:reportProgress(dl.index - 1)
+    end
+    UIManager:scheduleIn(0.1, function() self:_downloadStep(dl) end)
+end
+
+function WeReadPlugin:_finishCurrentDownloadChapter(dl)
+    if dl.cancelled or not dl.current then return end
+    local chapter = dl.current.chapter
+    local cache = self.settings:get("cache")
+    local stage_text
+    if cache.download_book_images then
+        stage_text = T(_("Downloading images · chapter %1/%2"), tostring(dl.index), tostring(dl.total))
+    else
+        stage_text = T(_("Processing chapter %1/%2"), tostring(dl.index), tostring(dl.total))
+    end
+    self:_setDownloadStage(dl,
+        stage_text, dl.index - 0.1)
+    local started = time.now()
+    local ok, xhtml, chapter_assets = pcall(function()
+        return Content.finalize_single_chapter_content(
+            self.client, self.settings, dl.book, chapter, dl.current.xhtml, dl.state
+        )
+    end)
+    self:_downloadPerf(dl, "images_and_finalize", started, "ok=", tostring(ok))
+    if not ok then
+        self:_failCurrentDownloadChapter(dl, xhtml)
+        return
+    end
+    local uid = tostring(chapter.chapterUid or dl.index)
+    dl.bodies[uid] = xhtml
+    table.insert(dl.selected, chapter)
+    for _i, asset in ipairs(chapter_assets or {}) do
+        table.insert(dl.assets, asset)
+    end
+    dl.current = nil
+    dl.annotation = nil
+    dl.index = dl.index + 1
+    if dl.progress_dialog then
+        dl.progress_dialog:reportProgress(dl.index - 1)
+    end
+    UIManager:scheduleIn(0.1, function() self:_downloadStep(dl) end)
+end
+
+function WeReadPlugin:_applyCurrentAnnotations(dl)
+    if dl.cancelled or not dl.current or not dl.annotation then return end
+    local annotation = dl.annotation
+    local chapter = dl.current.chapter
+    local book_id = dl.book.book_id or dl.book.bookId
+    self:_setDownloadStage(dl,
+        T(_("Processing underlines and thoughts · chapter %1/%2"), tostring(dl.index), tostring(dl.total)),
+        dl.index - 0.15)
+    local started = time.now()
+    local ok, processed, annotation_css = pcall(function()
+        return Thoughts.apply_data(self.settings, book_id, chapter.chapterUid,
+            dl.current.xhtml, annotation.underlines, annotation.reviews)
+    end)
+    self:_downloadPerf(dl, "apply_annotations", started, "ok=", tostring(ok),
+        "reviews=", tostring(#annotation.reviews))
+    if not ok then
+        self:_failCurrentDownloadChapter(dl, processed)
+        return
+    end
+    dl.current.xhtml = processed
+    dl.state.annotation_css_seen = dl.state.annotation_css_seen or {}
+    if annotation_css ~= "" and not dl.state.annotation_css_seen[annotation_css] then
+        dl.state.css = Thoughts.merge_css(dl.state.css, annotation_css)
+        dl.state.annotation_css_seen[annotation_css] = true
+    end
+    self:_finishCurrentDownloadChapter(dl)
+end
+
+function WeReadPlugin:_downloadAnnotationBatch(dl)
+    if dl.cancelled then
+        self:showTransientInfo(_("Download cancelled"), 2)
+        return
+    end
+    local annotation = dl.annotation
+    if not annotation then
+        self:_finishCurrentDownloadChapter(dl)
+        return
+    end
+    if annotation.batch_index > #annotation.batches then
+        self:_applyCurrentAnnotations(dl)
+        return
+    end
+
+    local batch_index = annotation.batch_index
+    local batch_total = #annotation.batches
+    local fractional = dl.index - 0.85 + 0.7 * batch_index / math.max(1, batch_total)
+    self:_setDownloadStage(dl,
+        T(_("Downloading thoughts %1/%2 · chapter %3/%4"),
+            tostring(batch_index), tostring(batch_total), tostring(dl.index), tostring(dl.total)),
+        fractional)
+
+    local started = time.now()
+    local ok, result, err = self.client:get_chapter_reviews_batch(
+        dl.book.book_id or dl.book.bookId,
+        dl.current.chapter.chapterUid,
+        annotation.batches[batch_index]
+    )
+    self:_downloadPerf(dl, "thought_batch", started,
+        "batch=", tostring(batch_index) .. "/" .. tostring(batch_total),
+        "ok=", tostring(ok), "retry=", tostring(annotation.retry))
+
+    if not ok then
+        if annotation.retry < 2 then
+            annotation.retry = annotation.retry + 1
+            self:_setDownloadStage(dl,
+                T(_("Retrying thoughts %1/%2 · attempt %3"),
+                    tostring(batch_index), tostring(batch_total), tostring(annotation.retry)),
+                fractional)
+            UIManager:scheduleIn(0.6 * annotation.retry, function()
+                self:_downloadAnnotationBatch(dl)
+            end)
+            return
+        end
+        dl.annotation_failed_batches = dl.annotation_failed_batches + 1
+        logger.warn(LOG_MODULE, "thought batch skipped:",
+            "batch=", tostring(batch_index) .. "/" .. tostring(batch_total),
+            "error=", log_error(err or "unknown"))
+    elseif result and type(result.reviews) == "table" then
+        for _, review in ipairs(result.reviews) do
+            annotation.reviews[#annotation.reviews + 1] = review
+        end
+    end
+
+    annotation.batch_index = batch_index + 1
+    annotation.retry = 0
+    UIManager:scheduleIn(0.3, function() self:_downloadAnnotationBatch(dl) end)
+end
+
+function WeReadPlugin:_startCurrentAnnotations(dl)
+    local chapter = dl.current.chapter
+    local book_id = dl.book.book_id or dl.book.bookId
+    self:_setDownloadStage(dl,
+        T(_("Downloading underlines · chapter %1/%2"), tostring(dl.index), tostring(dl.total)),
+        dl.index - 0.85)
+    local started = time.now()
+    local ok, underlines, ranges, err = Thoughts.fetch_underlines(
+        self.client, self.settings, book_id, chapter.chapterUid
+    )
+    self:_downloadPerf(dl, "underlines", started, "ok=", tostring(ok),
+        "ranges=", tostring(#(ranges or {})))
+    if not ok or type(underlines) ~= "table" then
+        logger.warn(LOG_MODULE, "skip chapter annotations:", log_error(err or "no data"))
+        self:_finishCurrentDownloadChapter(dl)
+        return
+    end
+    dl.annotation = {
+        underlines = underlines,
+        reviews = {},
+        batches = self.client:build_chapter_review_batches(ranges),
+        batch_index = 1,
+        retry = 0,
+    }
+    if #dl.annotation.batches == 0 then
+        self:_applyCurrentAnnotations(dl)
+    else
+        UIManager:scheduleIn(0.1, function() self:_downloadAnnotationBatch(dl) end)
+    end
+end
+
 function WeReadPlugin:_downloadStep(dl)
     if dl.cancelled then
         self:showTransientInfo(_("Download cancelled"), 2)
@@ -2222,17 +2441,28 @@ function WeReadPlugin:_downloadStep(dl)
             self:showInfo(_("No chapters were downloaded."))
             return
         end
-        local cover_data
-        local cover_url = WeRead.normalize_cover_url(dl.book.cover)
-        if cover_url and cover_url ~= "" then
-            pcall(function() cover_data = self.client:get_binary(cover_url) end)
-        end
+        self:_setDownloadStage(dl, _("Building EPUB..."), dl.total)
+        local save_started = time.now()
         local ok, path = pcall(function()
+            if dl.single_chapter then
+                local chapter = dl.selected[1]
+                local uid = tostring(chapter.chapterUid or 1)
+                return Content.save_chapter_epub(
+                    self.settings, dl.book, chapter, dl.bodies[uid], dl.assets, dl.state.css
+                )
+            end
+            local cover_data
+            local cover_url = WeRead.normalize_cover_url(dl.book.cover)
+            if cover_url and cover_url ~= "" then
+                pcall(function() cover_data = self.client:get_binary(cover_url) end)
+            end
             return Content.save_book_epub(
                 self.settings, dl.book, dl.selected, dl.bodies,
                 dl.suffix, dl.assets, dl.state.css, cover_data
             )
         end)
+        self:_downloadPerf(dl, "save_epub", save_started, "ok=", tostring(ok),
+            "single=", tostring(dl.single_chapter))
         if dl.progress_dialog then
             dl.progress_dialog:close()
             dl.progress_dialog = nil
@@ -2277,6 +2507,16 @@ function WeReadPlugin:_downloadStep(dl)
         else
             completion_text = T(_("Downloaded %1 chapters.\n\nBook saved:\n%2\n\nRead now?"), tostring(#dl.selected), path)
         end
+        if dl.annotation_failed_batches > 0 then
+            completion_text = completion_text .. "\n\n" .. T(
+                _("%1 thought batch(es) failed after retries; the EPUB contains the remaining available thoughts."),
+                tostring(dl.annotation_failed_batches)
+            )
+        end
+        self:_downloadPerf(dl, "download_total", dl.started_at,
+            "success_chapters=", tostring(#dl.selected),
+            "failed_chapters=", tostring(#dl.failed),
+            "failed_thought_batches=", tostring(dl.annotation_failed_batches))
         UIManager:show(ConfirmBox:new{
             text = completion_text,
             ok_text = _("Read now"),
@@ -2289,39 +2529,27 @@ function WeReadPlugin:_downloadStep(dl)
     end
 
     local chapter = dl.chapters[dl.index]
-    local ok, xhtml, chapter_assets = pcall(function()
-        return Content.fetch_single_chapter_content(
+    self:_setDownloadStage(dl,
+        T(_("Downloading chapter %1/%2: %3"), tostring(dl.index), tostring(dl.total),
+            chapter.title or tostring(chapter.chapterUid)),
+        dl.index - 1)
+    local started = time.now()
+    local ok, xhtml = pcall(function()
+        return Content.fetch_single_chapter_source(
             self.client, self.settings, dl.book, chapter, dl.state
         )
     end)
-
-    if ok then
-        local uid = tostring(chapter.chapterUid or dl.index)
-        dl.bodies[uid] = xhtml
-        table.insert(dl.selected, chapter)
-        for _i, asset in ipairs(chapter_assets or {}) do
-            table.insert(dl.assets, asset)
-        end
+    self:_downloadPerf(dl, "chapter_source", started, "ok=", tostring(ok))
+    if not ok then
+        self:_failCurrentDownloadChapter(dl, xhtml)
+        return
+    end
+    dl.current = { chapter = chapter, xhtml = xhtml }
+    if Thoughts.is_download_enabled(self.settings) then
+        self:_startCurrentAnnotations(dl)
     else
-        local uid = tostring(chapter.chapterUid or dl.index)
-        table.insert(dl.failed, uid)
-        logger.warn(
-            LOG_MODULE,
-            "chapter download failed:",
-            "index=", tostring(dl.index) .. "/" .. tostring(dl.total),
-            "chapter_uid=", uid,
-            "error=", log_error(xhtml)
-        )
+        self:_finishCurrentDownloadChapter(dl)
     end
-
-    dl.index = dl.index + 1
-    if dl.progress_dialog then
-        dl.progress_dialog:reportProgress(dl.index - 1)
-    end
-
-    UIManager:scheduleIn(0.1, function()
-        self:_downloadStep(dl)
-    end)
 end
 
 function WeReadPlugin:pullProgressWithUI(book_id)

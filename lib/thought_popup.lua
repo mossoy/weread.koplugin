@@ -33,7 +33,7 @@ local logger = require("logger")
 
 local function thought_perf(stage, started, ...)
     local elapsed = tonumber(time.now() - started) / 1000
-    logger.info("weread: thought_perf", "stage=", stage,
+    logger.dbg("weread: thought_perf", "stage=", stage,
         "ms=", string.format("%.1f", elapsed), ...)
 end
 -- ============================================================================
