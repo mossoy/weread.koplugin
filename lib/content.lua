@@ -78,6 +78,82 @@ function Content.book_resolved_dir(settings, book_id, book)
     return dir or Content.book_cache_dir(settings, book_id)
 end
 
+function Content.catalog_cache_path(settings, book)
+    local book_id = book and (book.book_id or book.bookId)
+    if not book_id then
+        return nil
+    end
+    return Content.book_resolved_dir(settings, book_id, book) .. "/catalog.json"
+end
+
+function Content.save_catalog_cache(client, settings, book, chapters)
+    if type(chapters) ~= "table" then
+        return false, "chapter list is not a table"
+    end
+    local path = Content.catalog_cache_path(settings, book)
+    if not path then
+        return false, "missing book id"
+    end
+    local dir = path:match("^(.*)/[^/]+$")
+    os.execute("mkdir -p " .. string.format("%q", dir))
+    local ok, encoded = pcall(function()
+        return client:json_encode({
+            version = 1,
+            updated_at = os.time(),
+            chapters = chapters,
+        })
+    end)
+    if not ok then
+        return false, encoded
+    end
+    local tmp_path = path .. ".tmp"
+    local file, err = io.open(tmp_path, "wb")
+    if not file then
+        return false, err
+    end
+    local write_ok, write_err = file:write(encoded)
+    file:close()
+    if not write_ok then
+        os.remove(tmp_path)
+        return false, write_err
+    end
+    local rename_ok, rename_err = os.rename(tmp_path, path)
+    if not rename_ok then
+        os.remove(tmp_path)
+        return false, rename_err
+    end
+    book.cache_dir = dir
+    return true, path
+end
+
+function Content.load_catalog_cache(client, settings, book)
+    local path = Content.catalog_cache_path(settings, book)
+    if not path then
+        return nil
+    end
+    local file = io.open(path, "rb")
+    if not file then
+        return nil
+    end
+    local encoded = file:read("*a")
+    file:close()
+    local ok, decoded = pcall(function()
+        return client:json_decode(encoded)
+    end)
+    if not ok or type(decoded) ~= "table" then
+        if logger then
+            logger.warn(LOG_MODULE, "ignore invalid catalog cache:", path)
+        end
+        return nil
+    end
+    local chapters = decoded.chapters
+    if type(chapters) ~= "table" then
+        return nil
+    end
+    book.chapters = chapters
+    return chapters
+end
+
 local function filename_safe(value)
     value = tostring(value or ""):gsub("[%z%c/\\:%*%?\"<>|]", "_")
     value = value:gsub("^%s+", ""):gsub("%s+$", "")
@@ -467,8 +543,9 @@ end
 
 function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
     local book_id = book.book_id or book.bookId
-    local dir = Content.book_cache_dir(settings, book_id)
+    local dir = Content.book_resolved_dir(settings, book_id, book)
     os.execute("mkdir -p " .. string.format("%q", dir))
+    book.cache_dir = dir
     local book_title = book.title or "WeRead"
     local path = dir .. "/" .. filename_safe(book_title .. " - " .. (chapter.title or tostring(chapter.chapterUid or "chapter"))) .. ".epub"
     local title = chapter.title or book.title or "WeRead"
@@ -538,8 +615,9 @@ end
 
 function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix, assets, css, cover_data)
     local book_id = book.book_id or book.bookId
-    local dir = Content.book_cache_dir(settings, book_id)
+    local dir = Content.book_resolved_dir(settings, book_id, book)
     os.execute("mkdir -p " .. string.format("%q", dir))
+    book.cache_dir = dir
     local book_title = book.title or "WeRead"
     local path = dir .. "/" .. filename_safe(book_title .. " - " .. (suffix or "book")) .. ".epub"
     local author = book.author or "WeRead"
@@ -1056,7 +1134,11 @@ end
 
 function Content.fetch_first_chapter(client, settings, book)
     Content.ensure_reader_state(client, book)
-    local chapters = book.chapters or Content.fetch_catalog(client, book)
+    local chapters = book.chapters or Content.load_catalog_cache(client, settings, book)
+    if not chapters then
+        chapters = Content.fetch_catalog(client, book)
+        Content.save_catalog_cache(client, settings, book, chapters)
+    end
     local chapter = Content.first_readable_chapter(chapters)
     if not chapter then
         error("No readable chapter found")

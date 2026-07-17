@@ -78,6 +78,7 @@ function WeReadPlugin:init()
     math.randomseed(os.time())
     self.settings = Settings:new()
     self.client = Client:new(self.settings)
+    self:migrateLegacyBookData()
     self.qr_login = QRLogin:new(self, self.client, self.settings)
     self.read_report = ReadReport:new{
         settings = self.settings,
@@ -105,6 +106,38 @@ function WeReadPlugin:init()
     ThoughtPopup.init()
     self._reader_session_gen = 0
     logger.info(LOG_MODULE, "initialized:", "version=", self.version)
+end
+
+function WeReadPlugin:migrateLegacyBookData()
+    local books = self.settings:get("books", {})
+    local found, migrated, failed = false, 0, 0
+    for _book_id, book in pairs(books) do
+        if type(book) == "table" and book.chapters ~= nil then
+            found = true
+            if type(book.chapters) == "table" then
+                local ok, saved = pcall(Content.save_catalog_cache,
+                    self.client, self.settings, book, book.chapters)
+                if ok and saved then
+                    migrated = migrated + 1
+                else
+                    failed = failed + 1
+                end
+            end
+            book.chapters = nil
+        end
+    end
+    if found or self.settings:has_legacy_book_records() then
+        local ok, err = pcall(function()
+            self.settings:set("books", books)
+            self.settings:flush()
+        end)
+        if ok then
+            logger.info(LOG_MODULE, "legacy per-book data migrated:",
+                "catalogs=", tostring(migrated), "catalog_failures=", tostring(failed))
+        else
+            logger.err(LOG_MODULE, "legacy per-book data migration failed:", log_error(err))
+        end
+    end
 end
 
 function WeReadPlugin:onDispatcherRegisterActions()
@@ -914,13 +947,7 @@ function WeReadPlugin:clearBookCache(book_id)
     local cache_dir = Content.book_resolved_dir(self.settings, book_id, books[book_id])
     os.execute("rm -rf " .. string.format("%q", cache_dir))
     if books[book_id] then
-        books[book_id].cached_file = nil
-        books[book_id].cached_chapters = nil
-        books[book_id].cache_dir = nil
-        if WeRead.is_mp_book(book_id) then
-            books[book_id].mp_articles = nil
-            books[book_id].mp_articles_time = nil
-        end
+        books[book_id] = nil
         self.settings:set("books", books)
         self.settings:flush()
     end
@@ -935,11 +962,7 @@ function WeReadPlugin:clearAllMPCache()
     for book_id, book in pairs(books) do
         if WeRead.is_mp_book(book_id) then
             os.execute("rm -rf " .. string.format("%q", Content.book_resolved_dir(self.settings, book_id, book)))
-            book.cached_file = nil
-            book.cached_chapters = nil
-            book.cache_dir = nil
-            book.mp_articles = nil
-            book.mp_articles_time = nil
+            books[book_id] = nil
         end
     end
     self.settings:set("books", books)
@@ -951,13 +974,8 @@ function WeReadPlugin:clearAllCache()
     local books = self.settings:get("books", {})
     for book_id, book in pairs(books) do
         os.execute("rm -rf " .. string.format("%q", Content.book_resolved_dir(self.settings, book_id, book)))
-        book.cached_file = nil
-        book.cached_chapters = nil
-        book.cache_dir = nil
-        book.mp_articles = nil
-        book.mp_articles_time = nil
     end
-    self.settings:set("books", books)
+    self.settings:set("books", {})
     self.settings:flush()
     self:refreshShelfCacheIndicators()
 end
@@ -1539,6 +1557,9 @@ end
 
 function WeReadPlugin:showBookMenu(book)
     local book_id = book.book_id or book.bookId
+    if type(book.chapters) ~= "table" then
+        Content.load_catalog_cache(self.client, self.settings, book)
+    end
     local menu, buildItems
     local function refresh()
         if menu then
@@ -1612,6 +1633,7 @@ function WeReadPlugin:showBookMenu(book)
                         book.cached_file = nil
                         book.cached_chapters = nil
                         book.cache_dir = nil
+                        book.chapters = nil
                         refresh()
                     end)
                 end),
@@ -1864,10 +1886,17 @@ function WeReadPlugin:downloadMPArticleAndRead(book, article)
     end)
 end
 
-function WeReadPlugin:loadChapters(book, callback)
-    if book.chapters and #book.chapters > 0 then
-        callback(book.chapters)
-        return
+function WeReadPlugin:loadChapters(book, callback, force_refresh)
+    if not force_refresh then
+        if book.chapters and #book.chapters > 0 then
+            callback(book.chapters)
+            return
+        end
+        local cached = Content.load_catalog_cache(self.client, self.settings, book)
+        if cached then
+            callback(cached)
+            return
+        end
     end
     if not self:requireLogin(true, false) then
         return
@@ -1884,6 +1913,11 @@ function WeReadPlugin:loadChapters(book, callback)
             self:showInfo(T(_("Load chapters failed:\n%1"), display_error(chapters_or_err)))
             return
         end
+        local cache_ok, cache_err = Content.save_catalog_cache(
+            self.client, self.settings, book, chapters_or_err)
+        if not cache_ok then
+            logger.warn(LOG_MODULE, "save chapter catalog cache failed:", log_error(cache_err))
+        end
         local books = self.settings:get("books", {})
         local book_id = book.book_id or book.bookId
         if book_id then
@@ -1896,8 +1930,21 @@ function WeReadPlugin:loadChapters(book, callback)
 end
 
 function WeReadPlugin:showChapterList(book)
-    self:loadChapters(book, function(chapters)
-        local items = {}
+    local menu
+    local function buildItems(chapters)
+        local items = {{
+            text = "↻ " .. _("Refresh chapter list"),
+            separator = true,
+            callback = self:safeCallback(_("Refresh chapter list"), function()
+                self:loadChapters(book, function(refreshed_chapters)
+                    if menu then
+                        menu:switchItemTable(nil, buildItems(refreshed_chapters))
+                    end
+                    self:showTransientInfo(T(_("Chapter list refreshed: %1 chapters"),
+                        tostring(#refreshed_chapters)), 2)
+                end, true)
+            end),
+        }}
         for _i, chapter in ipairs(chapters) do
             local cached = book.cached_chapters and book.cached_chapters[tostring(chapter.chapterUid)]
             table.insert(items, {
@@ -1912,7 +1959,10 @@ function WeReadPlugin:showChapterList(book)
                 end),
             })
         end
-        self:showList(book.title or _("Chapter list"), items, _("No chapters."))
+        return items
+    end
+    self:loadChapters(book, function(chapters)
+        menu = self:showList(book.title or _("Chapter list"), buildItems(chapters), _("No chapters."))
     end)
 end
 

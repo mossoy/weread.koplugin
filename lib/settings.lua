@@ -1,4 +1,5 @@
 local DataStorage = require("datastorage")
+local BookStore = require("lib.book_store")
 local Cookie = require("lib.cookie")
 local LuaSettings = require("luasettings")
 local lfs = require("libs/libkoreader-lfs")
@@ -151,11 +152,35 @@ function Settings:get(key, default)
     if default == nil then
         default = defaults[key]
     end
-    return self.store:readSetting(key, deepcopy(default))
+    if key ~= "books" then
+        return self.store:readSetting(key, deepcopy(default))
+    end
+    local indexes = self.store:readSetting("books", {})
+    local books = {}
+    for book_id, index in pairs(indexes or {}) do
+        books[book_id] = BookStore.load(self, book_id, index)
+    end
+    return books
 end
 
 function Settings:set(key, value)
+    if key == "books" and type(value) == "table" then
+        local indexes = {}
+        for book_id, book in pairs(value) do
+            local ok, index_or_err = BookStore.save(self, book_id, book)
+            if not ok then
+                error("Could not save book data: " .. tostring(index_or_err))
+            end
+            indexes[book_id] = index_or_err
+        end
+        value = indexes
+    end
     self.store:saveSetting(key, value)
+end
+
+function Settings:has_legacy_book_records()
+    local books = self.store:readSetting("books", {})
+    return not BookStore.is_minimal_index(books)
 end
 
 function Settings:flush()

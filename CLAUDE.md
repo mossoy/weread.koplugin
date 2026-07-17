@@ -15,6 +15,7 @@ KOReader plugin for reading WeRead (微信读书) books and MP articles on e-ink
 ```
 main.lua               Plugin entry and UI/event wiring
 lib/client.lua          HTTP client (cookie-auth Web API + Bearer-auth gateway API)
+lib/book_store.lua      Per-book metadata, reading-state, and article-list persistence
 lib/content.lua         Content decoding (e_0/e_1/e_2/e_3), EPUB/HTML generation
 lib/cookie.lua          Cookie header parsing and merging
 lib/crypto.lua          SHA-256, MD5 (pure Lua)

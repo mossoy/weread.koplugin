@@ -10,6 +10,7 @@
 
 - 浏览微信读书书架，搜索书籍
 - 下载单章或整本书为 EPUB，直接在 KOReader 中阅读
+- 章节目录按书籍缓存为独立 `catalog.json`，并支持在章节列表中手动刷新
 - 章节内容解码、CSS 样式、图片资源打包
 - 自动生成目录（TOC），自动嵌入封面
 - 下载并嵌入划线和想法，阅读时可一键显示/隐藏，点击划线查看想法内容
@@ -36,6 +37,8 @@
 - EPUB 自动嵌入封面图片
 - 缓存管理：查看/清理单本或全部缓存
 - 自定义下载目录：可指定书籍/文章的保存位置（默认 `<KOReader 数据目录>/weread/cache`）
+- 每本书的目录保存在 `<缓存目录>/<书籍 ID>/catalog.json`；旧版 `weread.lua` 中的目录会在启动时自动迁移
+- 书籍元数据、阅读上下文和公众号文章列表分别保存在书籍目录的 `metadata.json`、`reading_state.json` 和 `articles.json`；`weread.lua` 只保留缓存路径索引
 
 ## TODO
 
@@ -79,7 +82,7 @@ koreader/plugins/weread.koplugin/
 ├── 同步进度           （阅读书籍时显示，开发中）
 ├── 书籍详情           （阅读微信读书缓存书籍时显示）
 ├── 显示划线和想法     （阅读书籍时显示，开关）
-├── 书架               书架浏览（书籍 + 公众号分类）
+├── 书架               书架浏览（书籍 + 公众号分类；章节列表可手动刷新）
 ├── 搜索               搜索微信读书
 ├── 阅读时间上报        后台上报阅读时长
 │   ├── 启用阅读时间上报
@@ -104,36 +107,6 @@ koreader/plugins/weread.koplugin/
 │       ├── 立即续期 Cookie
 │       └── 清除账号数据
 └── 关于
-```
-
-## 文件结构
-
-```
-weread.koplugin/
-├── _meta.lua              插件元数据
-├── main.lua               插件入口与 UI 接线
-├── CLAUDE.md              开发规范
-├── lib/
-│   ├── client.lua          HTTP 客户端
-│   ├── content.lua         内容解码、EPUB/HTML 生成
-│   ├── cookie.lua          Cookie 解析
-│   ├── crypto.lua          SHA-256、MD5
-│   ├── download_dialog.lua 下载进度对话框
-│   ├── i18n.lua            中文翻译
-│   ├── qr_login.lua        扫码登录协议、状态机与凭证保存
-│   ├── read_report.lua     阅读时间上报状态机、会话刷新与重试
-│   ├── reader_state.lua    Web Reader 会话与阅读位置解析
-│   ├── settings.lua        设置持久化
-│   └── weread.lua          微信读书协议工具
-├── scripts/
-│   ├── fetch_weread_epub.py     EPUB 生成参考脚本
-│   ├── verify_qr_login.py       扫码登录协议验证（不保存凭证）
-│   ├── verify_mp_articles.py    公众号 API 验证脚本
-│   ├── test_read_report.lua     阅读上报状态机回归测试
-│   └── test_reader_state.lua    Reader 会话解析回归测试
-└── docs/
-    ├── weread-api-reference.md      API 接口参考
-    └── weread-content-research.md   内容解码研究
 ```
 
 ## 贡献 

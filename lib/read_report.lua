@@ -372,8 +372,16 @@ function ReadReport:ensure_context(book_id, force)
     end
 
     Content.ensure_reader_state(self.client, book)
+    if not force and (type(book.chapters) ~= "table" or #book.chapters == 0) then
+        Content.load_catalog_cache(self.client, self.settings, book)
+    end
     if force or type(book.chapters) ~= "table" or #book.chapters == 0 then
-        Content.fetch_catalog(self.client, book)
+        local chapters = Content.fetch_catalog(self.client, book)
+        local cache_ok, cache_err = Content.save_catalog_cache(
+            self.client, self.settings, book, chapters)
+        if not cache_ok then
+            log("warn", "save chapter catalog cache failed:", tostring(cache_err))
+        end
     end
     self:_merge_remote_progress(book_id, book)
 
